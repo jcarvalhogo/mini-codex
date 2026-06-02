@@ -1,19 +1,23 @@
 use anyhow::Context;
 use anyhow::Result;
+mod model_profiles;
+use model_profiles::ModelProfile;
+use model_profiles::profile_for_model;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::process::Command;
+use tokio::time::MissedTickBehavior;
 
-const DEFAULT_MODEL: &str = "deepseek-r1:14b";
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
 
-const SYSTEM_PROMPT: &str = r#"
+const BASE_SYSTEM_PROMPT: &str = r#"
 You are Mini Codex, a local coding assistant.
 
 You can either answer normally or request one or more tool calls.
@@ -64,16 +68,11 @@ Short XML-style tool calls are also accepted:
 Rules:
 - Do not claim you executed a command unless a tool result was provided.
 - If a tool result is empty, say it is empty. Do not invent files, output, or command results.
-- When using a reasoning model, keep reasoning out of the final answer and put only the requested tool call in a tool-call response.
-- If a tool is needed, output the tool call only. Do not wrap it in prose, Markdown commentary, or explanations.
-- After a tool result, continue with the next required tool call until the user request is fully complete.
-- Do not provide shell commands as instructions when the user asked you to run them. Use the shell tool.
 - Prefer read_file, write_file, patch_file, and list_dir for file operations.
 - For small edits to existing files, use patch_file instead of write_file.
 - Prefer shell with cwd over commands that start with cd.
 - Prefer small, specific commands.
 - Do not use destructive commands.
-- When writing files, do not add leading blank lines unless the user explicitly asked for them.
 - When creating Rust projects, use edition = "2024", write Cargo.toml and src/main.rs, then ask to run cargo build with cwd.
 - If you can answer without a tool, answer directly.
 "#;
@@ -101,21 +100,21 @@ struct ChatResponseMessage {
     content: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ToolCall {
-    tool: String,
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ToolCall {
+    pub(crate) tool: String,
     #[serde(default)]
-    cmd: String,
+    pub(crate) cmd: String,
     #[serde(default)]
-    cwd: String,
+    pub(crate) cwd: String,
     #[serde(default)]
-    path: String,
+    pub(crate) path: String,
     #[serde(default)]
-    content: String,
+    pub(crate) content: String,
     #[serde(default)]
-    old: String,
+    pub(crate) old: String,
     #[serde(default)]
-    new: String,
+    pub(crate) new: String,
 }
 
 #[derive(Debug)]
@@ -146,7 +145,9 @@ struct AppConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = std::env::var("MINI_CODEX_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model = std::env::var("MINI_CODEX_MODEL")
+        .unwrap_or_else(|_| model_profiles::DEFAULT_MODEL.to_string());
+    let model_profile = profile_for_model(&model);
     let ollama_url =
         std::env::var("MINI_CODEX_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
     let auto_approve = env_flag("MINI_CODEX_AUTO_APPROVE");
@@ -158,7 +159,7 @@ async fn main() -> Result<()> {
         session_log_path: workspace.join(".mini-codex").join("session.jsonl"),
         workspace,
     };
-    init_session_log(&config).with_context(|| {
+    init_session_log(&config, &model, &model_profile).with_context(|| {
         format!(
             "failed to initialize session log at {}",
             config.session_log_path.display()
@@ -168,11 +169,15 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
-        content: SYSTEM_PROMPT.trim().to_string(),
+        content: model_profile.system_prompt(BASE_SYSTEM_PROMPT),
     }];
 
     println!("mini-codex");
     println!("model: {model}");
+    println!(
+        "model profile: {} ({})",
+        model_profile.display_name, model_profile.id
+    );
     println!("workspace: {}", config.workspace.display());
     println!("session log: {}", config.session_log_path.display());
     println!("auto approve: {auto_approve}");
@@ -189,9 +194,10 @@ async fn main() -> Result<()> {
         }
         append_session_event(&config, "user", json!({ "content": input }))?;
 
-        let direct_tool_calls = parse_tool_calls(&input)?;
+        let direct_tool_calls = parse_tool_calls(&input, &model_profile)?;
         if !direct_tool_calls.is_empty() {
-            let outcomes = run_tool_calls(&config, direct_tool_calls, auto_approve).await?;
+            let outcomes =
+                run_tool_calls(&config, &model_profile, direct_tool_calls, auto_approve).await?;
             print_tool_results(&outcomes);
             print_turn_summary(&outcomes);
             log_tool_outcomes(&config, &outcomes)?;
@@ -200,7 +206,7 @@ async fn main() -> Result<()> {
 
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: input,
+            content: input.clone(),
         });
 
         run_agent_turn(
@@ -208,6 +214,8 @@ async fn main() -> Result<()> {
             &client,
             &ollama_url,
             &model,
+            &model_profile,
+            &input,
             &mut messages,
             auto_approve,
             plan_first,
@@ -223,36 +231,54 @@ async fn run_agent_turn(
     client: &reqwest::Client,
     ollama_url: &str,
     model: &str,
+    model_profile: &ModelProfile,
+    original_request: &str,
     messages: &mut Vec<ChatMessage>,
     auto_approve: bool,
     plan_first: bool,
 ) -> Result<()> {
     if plan_first {
-        request_plan_first(config, client, ollama_url, model, messages).await?;
+        request_plan_first(config, client, ollama_url, model, model_profile, messages).await?;
     }
 
     for _ in 0..6 {
         let answer = call_ollama(client, ollama_url, model, messages).await?;
         append_session_event(config, "assistant", json!({ "content": answer }))?;
 
-        let tool_calls = parse_tool_calls(&answer)?;
+        let tool_calls = parse_tool_calls(&answer, model_profile)?;
         if !tool_calls.is_empty() {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: answer,
             });
 
-            let outcomes = run_tool_calls(config, tool_calls, auto_approve).await?;
+            let outcomes = run_tool_calls(config, model_profile, tool_calls, auto_approve).await?;
             print_tool_results(&outcomes);
             log_tool_outcomes(config, &outcomes)?;
+            let tool_results = format_tool_results(&outcomes);
+            let followup_guidance = tool_result_guidance(&outcomes);
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
-                    "Tool results:\n{}\n\nContinue the original request. If any remaining step requires a tool, output only the next tool call.",
-                    format_tool_results(&outcomes)
+                    "{}{}",
+                    model_profile.tool_result_followup(original_request, &tool_results),
+                    followup_guidance
                 ),
             });
             print_turn_summary(&outcomes);
+            continue;
+        }
+
+        if looks_like_unsupported_tool_request(&answer) {
+            println!("\nModel requested an unsupported tool. Asking it to use Mini Codex tools.\n");
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: answer,
+            });
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: unsupported_tool_feedback(),
+            });
             continue;
         }
 
@@ -268,20 +294,35 @@ async fn run_agent_turn(
     Ok(())
 }
 
+fn looks_like_unsupported_tool_request(answer: &str) -> bool {
+    let lower = answer.to_lowercase();
+    (lower.contains("tool call") || lower.contains("tool_calls"))
+        && (lower.contains("beautifulsoup")
+            || lower.contains("```python")
+            || lower.contains("\"parser\"")
+            || lower.contains("unsupported tool")
+            || lower.contains("library will help"))
+}
+
+fn unsupported_tool_feedback() -> String {
+    "The previous response requested an unsupported tool. Mini Codex only supports shell, read_file, write_file, patch_file, and list_dir. If parsing HTML or structured text is needed, use the shell tool to run an available command or script. Output only the next supported tool call if more work is needed.".to_string()
+}
+
 async fn request_plan_first(
     config: &AppConfig,
     client: &reqwest::Client,
     ollama_url: &str,
     model: &str,
+    model_profile: &ModelProfile,
     messages: &mut Vec<ChatMessage>,
 ) -> Result<()> {
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: "First provide a short implementation plan. Do not call tools yet.".to_string(),
+        content: model_profile.plan_prompt().to_string(),
     });
 
     let raw_plan = call_ollama(client, ollama_url, model, messages).await?;
-    let plan = sanitize_plan_response(&raw_plan);
+    let plan = model_profile.sanitize_plan_response(&raw_plan);
     append_session_event(config, "plan", json!({ "content": plan }))?;
     println!("\nPlan:\n{plan}\n");
     messages.push(ChatMessage {
@@ -290,77 +331,41 @@ async fn request_plan_first(
     });
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: "Now execute the plan using tools. Do not repeat the plan.".to_string(),
+        content: model_profile.execute_plan_prompt().to_string(),
     });
     Ok(())
 }
 
-fn sanitize_plan_response(plan: &str) -> String {
-    let plan = remove_tagged_block(plan, "<tool_call>", "</tool_call>");
-    let plan = remove_tagged_block(&plan, "<write_file", "</write_file>");
-    let plan = remove_fenced_json_tool_calls(&plan);
-    let plan = plan
-        .lines()
-        .filter(|line| !is_standalone_tool_call_line(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    plan.trim().to_string()
-}
-
-fn remove_tagged_block(input: &str, start_marker: &str, end_marker: &str) -> String {
-    let mut output = String::new();
-    let mut rest = input;
-    while let Some(start) = rest.find(start_marker) {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start..];
-        let Some(end_relative) = after_start.find(end_marker) else {
-            output.push_str(after_start);
-            return output;
-        };
-        rest = &after_start[end_relative + end_marker.len()..];
-    }
-    output.push_str(rest);
-    output
-}
-
-fn remove_fenced_json_tool_calls(input: &str) -> String {
-    let mut output = String::new();
-    let mut rest = input;
-    while let Some(fence_start) = rest.find("```") {
-        let after_opening_fence = &rest[fence_start + "```".len()..];
-        let Some(first_newline) = after_opening_fence.find('\n') else {
-            break;
-        };
-        let fenced_body_start = fence_start + "```".len() + first_newline + 1;
-        let Some(relative_fence_end) = rest[fenced_body_start..].find("```") else {
-            break;
-        };
-        let fenced_body = rest[fenced_body_start..fenced_body_start + relative_fence_end].trim();
-        if fenced_body.starts_with('{') && serde_json::from_str::<ToolCall>(fenced_body).is_ok() {
-            output.push_str(&rest[..fence_start]);
-            rest = &rest[fenced_body_start + relative_fence_end + "```".len()..];
-        } else {
-            let keep_end = fenced_body_start + relative_fence_end + "```".len();
-            output.push_str(&rest[..keep_end]);
-            rest = &rest[keep_end..];
-        }
-    }
-    output.push_str(rest);
-    output
-}
-
-fn is_standalone_tool_call_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    matches!(
-        trimmed,
-        "<read_file" | "<list_dir" | "<shell" | "<write_file" | "<tool_call>"
-    ) || serde_json::from_str::<ToolCall>(trimmed).is_ok()
-        || ["<read_file", "<list_dir", "<shell"]
-            .iter()
-            .any(|prefix| trimmed.starts_with(prefix) && trimmed.ends_with("/>"))
-}
-
 async fn call_ollama(
+    client: &reqwest::Client,
+    ollama_url: &str,
+    model: &str,
+    messages: &[ChatMessage],
+) -> Result<String> {
+    print!("\nmodel thinking");
+    std::io::stdout().flush()?;
+
+    let request = call_ollama_request(client, ollama_url, model, messages);
+    tokio::pin!(request);
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticks.tick().await;
+
+    let result = loop {
+        tokio::select! {
+            result = &mut request => break result,
+            _ = ticks.tick() => {
+                print!(".");
+                std::io::stdout().flush()?;
+            }
+        }
+    };
+
+    println!(" done");
+    result
+}
+
+async fn call_ollama_request(
     client: &reqwest::Client,
     ollama_url: &str,
     model: &str,
@@ -393,14 +398,20 @@ async fn call_ollama(
     Ok(response.message.content.trim().to_string())
 }
 
-fn parse_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
+fn parse_tool_calls(answer: &str, model_profile: &ModelProfile) -> Result<Vec<ToolCall>> {
     let mut tool_calls = Vec::new();
 
-    tool_calls.extend(parse_write_file_blocks(answer)?);
+    tool_calls.extend(parse_write_file_blocks(answer, model_profile)?);
     tool_calls.extend(parse_xml_style_tool_calls(answer)?);
     tool_calls.extend(parse_tagged_tool_call_blocks(answer)?);
     tool_calls.extend(parse_fenced_tool_calls(answer)?);
+    tool_calls.extend(parse_fenced_shell_tool_calls(answer));
 
+    if !tool_calls.is_empty() {
+        return Ok(tool_calls);
+    }
+
+    tool_calls.extend(parse_line_delimited_json_tool_calls(answer)?);
     if !tool_calls.is_empty() {
         return Ok(tool_calls);
     }
@@ -414,6 +425,45 @@ fn parse_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
     }
 
     Ok(Vec::new())
+}
+
+fn parse_line_delimited_json_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
+    let mut tool_calls = Vec::new();
+    for line in answer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !line.starts_with('{') || !line.ends_with('}') || !line.contains("\"tool\"") {
+            continue;
+        }
+
+        if let Ok(tool_call) = serde_json::from_str::<ToolCall>(line) {
+            tool_calls.push(tool_call);
+        } else if let Some(tool_call) = parse_lenient_shell_json_tool_call(line) {
+            tool_calls.push(tool_call);
+        }
+    }
+    Ok(tool_calls)
+}
+
+fn parse_lenient_shell_json_tool_call(line: &str) -> Option<ToolCall> {
+    let prefix = r#"{"tool":"shell","cmd":""#;
+    let command = line
+        .strip_prefix(prefix)?
+        .strip_suffix(r#""}"#)?
+        .replace(r#"\""#, r#"""#)
+        .replace(r#"\\"#, r#"\"#);
+
+    Some(ToolCall {
+        tool: "shell".to_string(),
+        cmd: command,
+        cwd: String::new(),
+        path: String::new(),
+        content: String::new(),
+        old: String::new(),
+        new: String::new(),
+    })
 }
 
 fn parse_tagged_tool_call_blocks(answer: &str) -> Result<Vec<ToolCall>> {
@@ -433,7 +483,7 @@ fn parse_tagged_tool_call_blocks(answer: &str) -> Result<Vec<ToolCall>> {
     Ok(tool_calls)
 }
 
-fn parse_write_file_blocks(answer: &str) -> Result<Vec<ToolCall>> {
+fn parse_write_file_blocks(answer: &str, model_profile: &ModelProfile) -> Result<Vec<ToolCall>> {
     let mut tool_calls = Vec::new();
     let mut rest = answer;
     while let Some(start) = rest.find("<write_file") {
@@ -449,10 +499,11 @@ fn parse_write_file_blocks(answer: &str) -> Result<Vec<ToolCall>> {
         let Some(close_relative) = rest[content_start..].find("</write_file>") else {
             break;
         };
-        let content = normalize_write_file_block_content(
-            &rest[content_start..content_start + close_relative],
-        )
-        .to_string();
+        let content = model_profile
+            .normalize_write_file_block_content(
+                &rest[content_start..content_start + close_relative],
+            )
+            .to_string();
         tool_calls.push(ToolCall {
             tool: "write_file".to_string(),
             cmd: String::new(),
@@ -465,13 +516,6 @@ fn parse_write_file_blocks(answer: &str) -> Result<Vec<ToolCall>> {
         rest = &rest[content_start + close_relative + "</write_file>".len()..];
     }
     Ok(tool_calls)
-}
-
-fn normalize_write_file_block_content(content: &str) -> &str {
-    content
-        .strip_prefix("\r\n")
-        .or_else(|| content.strip_prefix('\n'))
-        .unwrap_or(content)
 }
 
 fn parse_xml_style_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
@@ -601,22 +645,62 @@ fn parse_fenced_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
         };
         let fenced_body = rest[fenced_body_start..fenced_body_start + relative_fence_end].trim();
         if fenced_body.starts_with('{') && fenced_body.contains("\"tool\"") {
-            let tool_call = serde_json::from_str::<ToolCall>(fenced_body)
-                .with_context(|| format!("malformed fenced tool call: {fenced_body}"))?;
-            tool_calls.push(tool_call);
+            if let Ok(tool_call) = serde_json::from_str::<ToolCall>(fenced_body) {
+                tool_calls.push(tool_call);
+            }
         }
         rest = &rest[fenced_body_start + relative_fence_end + "```".len()..];
     }
     Ok(tool_calls)
 }
 
+fn parse_fenced_shell_tool_calls(answer: &str) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+    let mut rest = answer;
+    while let Some(fence_start) = rest.find("```") {
+        let after_opening_fence = &rest[fence_start + "```".len()..];
+        let Some(first_newline) = after_opening_fence.find('\n') else {
+            break;
+        };
+        let language = after_opening_fence[..first_newline].trim().to_lowercase();
+        let fenced_body_start = fence_start + "```".len() + first_newline + 1;
+        let Some(relative_fence_end) = rest[fenced_body_start..].find("```") else {
+            break;
+        };
+        let fenced_body = rest[fenced_body_start..fenced_body_start + relative_fence_end].trim();
+        if matches!(language.as_str(), "bash" | "sh" | "shell")
+            && !fenced_body.is_empty()
+            && !looks_like_json_tool_call(fenced_body)
+        {
+            tool_calls.push(ToolCall {
+                tool: "shell".to_string(),
+                cmd: fenced_body.to_string(),
+                cwd: String::new(),
+                path: String::new(),
+                content: String::new(),
+                old: String::new(),
+                new: String::new(),
+            });
+        }
+        rest = &rest[fenced_body_start + relative_fence_end + "```".len()..];
+    }
+    tool_calls
+}
+
+fn looks_like_json_tool_call(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.contains("\"tool\"")
+}
+
 async fn run_tool_calls(
     config: &AppConfig,
+    model_profile: &ModelProfile,
     tool_calls: Vec<ToolCall>,
     auto_approve: bool,
 ) -> Result<Vec<ToolOutcome>> {
     let mut outcomes = Vec::new();
     for (index, tool_call) in tool_calls.into_iter().enumerate() {
+        let tool_call = model_profile.normalize_tool_call(tool_call, &config.workspace);
         let mut outcome = run_tool_call(config, tool_call, auto_approve)
             .await
             .with_context(|| format!("tool call {} failed", index + 1))?;
@@ -890,6 +974,66 @@ fn print_tool_results(outcomes: &[ToolOutcome]) {
     println!("\nTool result:\n{}\n", format_tool_results(outcomes));
 }
 
+fn tool_result_guidance(outcomes: &[ToolOutcome]) -> String {
+    let commands = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.command.as_ref())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        return String::new();
+    }
+
+    let mut guidance = Vec::new();
+    if commands.iter().any(|command| command.success) {
+        guidance.push("Do not repeat successful setup commands unless their output is missing or the file changed.");
+    }
+    if outcomes.iter().any(|outcome| {
+        outcome
+            .command
+            .as_ref()
+            .is_some_and(|command| command.success)
+            && stdout_has_content(&outcome.result)
+    }) {
+        guidance.push("If stdout already contains the requested answer, stop calling tools and provide the final answer from that output.");
+    }
+    if commands.iter().any(|command| !command.success) {
+        guidance.push("One or more commands failed. Do not repeat failed commands unchanged; choose a different supported approach.");
+    }
+    if commands.iter().any(|command| {
+        command.cmd.contains(".html")
+            || command.cmd.contains("<h1")
+            || command.cmd.contains("grep")
+            || command.cmd.contains("sed")
+    }) {
+        guidance.push("For HTML parsing, prefer shell with python3 and standard-library parsing or a single robust command instead of fragile multi-line grep/sed patterns.");
+    }
+
+    if guidance.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nExecution guidance:\n{}",
+            guidance
+                .into_iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
+fn stdout_has_content(tool_result: &str) -> bool {
+    let Some(stdout_start) = tool_result.find("stdout:\n") else {
+        return false;
+    };
+    let stdout = &tool_result[stdout_start + "stdout:\n".len()..];
+    let stdout = stdout
+        .split_once("\nstderr:")
+        .map(|(stdout, _)| stdout)
+        .unwrap_or(stdout);
+    !stdout.trim().is_empty()
+}
+
 fn print_turn_summary(outcomes: &[ToolOutcome]) {
     let commands = outcomes
         .iter()
@@ -932,7 +1076,7 @@ fn print_turn_summary(outcomes: &[ToolOutcome]) {
     println!();
 }
 
-fn init_session_log(config: &AppConfig) -> Result<()> {
+fn init_session_log(config: &AppConfig, model: &str, model_profile: &ModelProfile) -> Result<()> {
     if let Some(parent) = config.session_log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -942,6 +1086,11 @@ fn init_session_log(config: &AppConfig) -> Result<()> {
         "session_start",
         json!({
             "workspace": config.workspace,
+            "model": model,
+            "model_profile": {
+                "id": model_profile.id,
+                "display_name": model_profile.display_name,
+            },
         }),
     )
 }
@@ -1147,41 +1296,162 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_file_block_content_drops_structural_leading_newline() {
-        assert_eq!(normalize_write_file_block_content("\nhello\n"), "hello\n");
-    }
+    fn detects_beautifulsoup_as_unsupported_tool_request() {
+        let answer = r#"To parse the HTML file, the next tool needed would be:
 
-    #[test]
-    fn write_file_block_content_drops_structural_leading_windows_newline() {
-        assert_eq!(
-            normalize_write_file_block_content("\r\nhello\r\n"),
-            "hello\r\n"
-        );
-    }
-
-    #[test]
-    fn write_file_block_content_preserves_inline_content() {
-        assert_eq!(normalize_write_file_block_content("hello\n"), "hello\n");
-    }
-
-    #[test]
-    fn plan_sanitizer_removes_tool_syntax_from_deepseek_style_plan() {
-        let plan = r#"**Implementation Plan:**
-
-1. Create a file.
-
-<write_file path="hello.txt">
-deepseek smoke test
-</write_file>
-
-{"tool":"shell","cmd":"cat hello.txt"}
+**Tool Call:**
+```python
+BeautifulSoup
+```
 "#;
 
-        let sanitized = sanitize_plan_response(plan);
+        assert!(looks_like_unsupported_tool_request(answer));
+    }
 
-        assert!(sanitized.contains("Implementation Plan"));
-        assert!(!sanitized.contains("<write_file"));
-        assert!(!sanitized.contains("deepseek smoke test"));
-        assert!(!sanitized.contains(r#""tool":"shell""#));
+    #[test]
+    fn plain_answer_is_not_an_unsupported_tool_request() {
+        assert!(!looks_like_unsupported_tool_request(
+            "The command succeeded and no further steps are needed."
+        ));
+    }
+
+    #[test]
+    fn parses_multiple_line_delimited_json_tool_calls() {
+        let profile = profile_for_model("deepseek-r1:14b");
+        let answer = r#"{"tool":"shell","cmd":"curl \"https://example.com\" --output page.html"}
+{"tool":"shell","cmd":"grep -o '<h1.*>' page.html"}
+"#;
+
+        let tool_calls = parse_tool_calls(answer, &profile).unwrap();
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].tool, "shell");
+        assert!(tool_calls[0].cmd.contains("curl"));
+        assert!(tool_calls[1].cmd.contains("grep"));
+    }
+
+    #[test]
+    fn parses_lenient_shell_json_tool_call_with_unescaped_inner_quotes() {
+        let profile = profile_for_model("deepseek-r1:14b");
+        let answer = r#"{"tool":"shell","cmd":"grep -o '<h1.*class=\"firstHeading\">.*</h1>' page.html; egrep '(?<=<h1 class="firstHeading">)(.*)(?=</h1>)' page.html"}"#;
+
+        let tool_calls = parse_tool_calls(answer, &profile).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool, "shell");
+        assert!(tool_calls[0].cmd.contains("firstHeading"));
+        assert!(tool_calls[0].cmd.contains("egrep"));
+    }
+
+    #[test]
+    fn parses_fenced_bash_as_shell_tool_call() {
+        let profile = profile_for_model("deepseek-r1:14b");
+        let answer = r#"Here is the tool call:
+```bash
+curl -o page.html https://example.com
+```
+"#;
+
+        let tool_calls = parse_tool_calls(answer, &profile).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool, "shell");
+        assert_eq!(tool_calls[0].cmd, "curl -o page.html https://example.com");
+    }
+
+    #[test]
+    fn fenced_bash_json_tool_call_is_not_duplicated_as_shell() {
+        let profile = profile_for_model("deepseek-r1:14b");
+        let answer = r#"Here is the tool call:
+```bash
+{"tool":"read_file","path":"page.html"}
+```
+"#;
+
+        let tool_calls = parse_tool_calls(answer, &profile).unwrap();
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].tool, "read_file");
+        assert_eq!(tool_calls[0].path, "page.html");
+    }
+
+    #[test]
+    fn malformed_fenced_tool_calls_json_does_not_crash_parser() {
+        let profile = profile_for_model("deepseek-r1:14b");
+        let answer = r#"```json
+{
+  "tool_calls": [
+    {
+      "tool": "parser",
+      "args": {
+        "command": "parser.sh --process-html wikipedia.html"
+      }
+    }
+  ]
+}
+```"#;
+
+        let tool_calls = parse_tool_calls(answer, &profile).unwrap();
+
+        assert!(tool_calls.is_empty());
+        assert!(looks_like_unsupported_tool_request(answer));
+    }
+
+    #[test]
+    fn tool_result_guidance_warns_after_failed_html_shell_command() {
+        let outcomes = vec![ToolOutcome {
+            result: "failed".to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "grep -P '<h1.*?>' page.html".to_string(),
+                cwd: PathBuf::from("/tmp/workspace"),
+                success: false,
+            }),
+        }];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("Do not repeat failed commands unchanged"));
+        assert!(guidance.contains("For HTML parsing"));
+        assert!(guidance.contains("python3"));
+    }
+
+    #[test]
+    fn tool_result_guidance_stops_when_successful_stdout_has_answer() {
+        let outcomes = vec![ToolOutcome {
+            result: "cwd: /tmp/workspace\nexit_status: exit status: 0\nstdout:\ntitle>Artificial intelligence in marketing - Wikipedia\nstderr:\n".to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "grep -Eo '<title>.*</title>' page.html".to_string(),
+                cwd: PathBuf::from("/tmp/workspace"),
+                success: true,
+            }),
+        }];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("stdout already contains the requested answer"));
+        assert!(guidance.contains("stop calling tools"));
+    }
+
+    #[test]
+    fn stdout_has_content_detects_non_empty_stdout_section() {
+        assert!(stdout_has_content(
+            "cwd: /tmp\nexit_status: exit status: 0\nstdout:\nanswer\nstderr:\n"
+        ));
+        assert!(!stdout_has_content(
+            "cwd: /tmp\nexit_status: exit status: 0\nstdout:\n\nstderr:\n"
+        ));
+    }
+
+    #[test]
+    fn tool_result_guidance_is_empty_without_commands() {
+        let outcomes = vec![ToolOutcome {
+            result: "read_file".to_string(),
+            changed_file: None,
+            command: None,
+        }];
+
+        assert_eq!(tool_result_guidance(&outcomes), "");
     }
 }

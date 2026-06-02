@@ -34,6 +34,13 @@ The agent successfully:
 
 - Ollama chat integration through `/api/chat`.
 - DeepSeek R1 14B default model through `deepseek-r1:14b`.
+- Model profile layer with DeepSeek R1-specific prompt handling, plan cleanup,
+  tool-result continuation, and write-file content normalization.
+- Active model and model profile are recorded in the session log.
+- Tool-result follow-up now warns models not to repeat successful setup commands
+  or failed commands unchanged, and suggests robust shell/Python parsing for HTML.
+- Tool-result follow-up now tells the model to stop calling tools when successful
+  stdout already contains the requested answer.
 - Configurable model override with `MINI_CODEX_MODEL`.
 - Optional auto-approval with `MINI_CODEX_AUTO_APPROVE=1`.
 - Optional plan-first mode with `MINI_CODEX_PLAN_FIRST=1`.
@@ -54,6 +61,12 @@ The agent successfully:
 - Diff display before `write_file` and `patch_file`.
 - Changed-files summary.
 - Command execution summary.
+- Thinking feedback while waiting for Ollama responses.
+- Unsupported-tool feedback when a model invents tools such as `BeautifulSoup`.
+- Fenced `bash`/`sh`/`shell` blocks are parsed as shell tool calls for model tolerance.
+- JSON tool calls inside fenced shell blocks are not duplicated as shell commands.
+- Lenient shell JSON parsing handles unescaped quotes inside generated commands.
+- Unsupported fenced JSON tool payloads no longer crash the session.
 - JSONL session log at:
 
 ```text
@@ -72,7 +85,10 @@ The final test was successful, but a few improvement points remain:
 
 ## Recommended Next Steps
 
-1. Validate DeepSeek R1 14B end-to-end on project creation, file edits, and command execution.
+1. Expand the model profile layer:
+   - add a profile trait or richer hooks if enum-style profiles become too small;
+   - add a Qwen coder profile for comparison;
+   - compare profile behavior across the same smoke-test tasks.
 
 2. Add a config file, for example `.mini-codex.toml`, so model, workspace,
    auto-approval, and plan-first mode do not need environment variables.
