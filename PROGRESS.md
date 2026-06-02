@@ -36,6 +36,10 @@ The agent successfully:
 - DeepSeek R1 14B default model through `deepseek-r1:14b`.
 - Model profile layer with DeepSeek R1-specific prompt handling, plan cleanup,
   tool-result continuation, and write-file content normalization.
+- Model selection now rejects models without a specialized profile instead of
+  falling back to generic behavior.
+- Project structure now separates orchestration, CLI, Ollama client, session
+  logging, tool parsing, tool execution, shared types, and model profiles.
 - Active model and model profile are recorded in the session log.
 - Tool-result follow-up now warns models not to repeat successful setup commands
   or failed commands unchanged, and suggests robust shell/Python parsing for HTML.
