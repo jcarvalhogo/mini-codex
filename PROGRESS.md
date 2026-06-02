@@ -71,6 +71,7 @@ The agent successfully:
 - JSON tool calls inside fenced shell blocks are not duplicated as shell commands.
 - Lenient shell JSON parsing handles unescaped quotes inside generated commands.
 - Unsupported fenced JSON tool payloads no longer crash the session.
+- Shell `cwd` may be absolute when it resolves inside the configured workspace.
 - JSONL session log at:
 
 ```text

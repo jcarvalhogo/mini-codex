@@ -137,10 +137,17 @@ fn normalize_write_file_block_content(content: &str) -> Cow<'_, str> {
 }
 
 fn normalize_tool_call(mut tool_call: ToolCall, workspace: &Path) -> ToolCall {
-    if tool_call.tool == "shell"
-        && !tool_call.cwd.trim().is_empty()
-        && !workspace.join(tool_call.cwd.trim()).exists()
-    {
+    if tool_call.tool != "shell" || tool_call.cwd.trim().is_empty() {
+        return tool_call;
+    }
+
+    let cwd = Path::new(tool_call.cwd.trim());
+    let exists = if cwd.is_absolute() {
+        cwd.exists()
+    } else {
+        workspace.join(cwd).exists()
+    };
+    if !exists {
         tool_call.cwd.clear();
     }
 
@@ -263,5 +270,25 @@ Then parse it.
         let normalized = profile.normalize_tool_call(tool_call, Path::new("/tmp"));
 
         assert_eq!(normalized.cwd, "");
+    }
+
+    #[test]
+    fn tool_call_preserves_existing_absolute_shell_cwd() {
+        let profile = profile();
+        let workspace = Path::new("/tmp/mini-codex-deepseek-absolute-cwd");
+        std::fs::create_dir_all(workspace).unwrap();
+        let tool_call = ToolCall {
+            tool: "shell".to_string(),
+            cmd: "cat hello.txt".to_string(),
+            cwd: workspace.display().to_string(),
+            path: String::new(),
+            content: String::new(),
+            old: String::new(),
+            new: String::new(),
+        };
+
+        let normalized = profile.normalize_tool_call(tool_call, workspace);
+
+        assert_eq!(normalized.cwd, workspace.display().to_string());
     }
 }

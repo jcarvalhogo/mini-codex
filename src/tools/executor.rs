@@ -231,18 +231,24 @@ fn list_dir_tool(config: &AppConfig, path: &str) -> Result<String> {
 }
 
 fn workspace_path(config: &AppConfig, path: &str) -> Result<PathBuf> {
-    let relative = Path::new(path);
-    if relative.is_absolute() {
-        anyhow::bail!("absolute paths are not allowed: {path}");
+    let requested = Path::new(path);
+    if requested.is_absolute() {
+        let canonical = requested
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {path}"))?;
+        if !canonical.starts_with(&config.workspace) {
+            anyhow::bail!("absolute path escapes workspace: {path}");
+        }
+        return Ok(canonical);
     }
-    if relative
+    if requested
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         anyhow::bail!("parent directory segments are not allowed: {path}");
     }
 
-    Ok(config.workspace.join(relative))
+    Ok(config.workspace.join(requested))
 }
 
 fn validate_shell_command(cmd: &str) -> Result<()> {
@@ -548,5 +554,35 @@ mod tests {
         }];
 
         assert_eq!(tool_result_guidance(&outcomes), "");
+    }
+
+    #[test]
+    fn workspace_path_accepts_absolute_path_inside_workspace() {
+        let config = AppConfig {
+            workspace: PathBuf::from("/tmp/mini-codex-test-workspace"),
+            session_log_path: PathBuf::from(
+                "/tmp/mini-codex-test-workspace/.mini-codex/session.jsonl",
+            ),
+        };
+        std::fs::create_dir_all(&config.workspace).unwrap();
+
+        let resolved = workspace_path(&config, "/tmp/mini-codex-test-workspace").unwrap();
+
+        assert_eq!(resolved, config.workspace);
+    }
+
+    #[test]
+    fn workspace_path_rejects_absolute_path_outside_workspace() {
+        let config = AppConfig {
+            workspace: PathBuf::from("/tmp/mini-codex-test-workspace"),
+            session_log_path: PathBuf::from(
+                "/tmp/mini-codex-test-workspace/.mini-codex/session.jsonl",
+            ),
+        };
+        std::fs::create_dir_all(&config.workspace).unwrap();
+
+        let error = workspace_path(&config, "/tmp").unwrap_err().to_string();
+
+        assert!(error.contains("escapes workspace"));
     }
 }
