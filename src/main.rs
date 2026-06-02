@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::process::Command;
 
-const DEFAULT_MODEL: &str = "qwen3-coder";
+const DEFAULT_MODEL: &str = "deepseek-r1:14b";
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
 
 const SYSTEM_PROMPT: &str = r#"
@@ -64,12 +64,17 @@ Short XML-style tool calls are also accepted:
 Rules:
 - Do not claim you executed a command unless a tool result was provided.
 - If a tool result is empty, say it is empty. Do not invent files, output, or command results.
+- When using a reasoning model, keep reasoning out of the final answer and put only the requested tool call in a tool-call response.
+- If a tool is needed, output the tool call only. Do not wrap it in prose, Markdown commentary, or explanations.
+- After a tool result, continue with the next required tool call until the user request is fully complete.
+- Do not provide shell commands as instructions when the user asked you to run them. Use the shell tool.
 - Prefer read_file, write_file, patch_file, and list_dir for file operations.
 - For small edits to existing files, use patch_file instead of write_file.
 - Prefer shell with cwd over commands that start with cd.
 - Prefer small, specific commands.
 - Do not use destructive commands.
-- When creating Rust projects, write Cargo.toml and src/main.rs, then ask to run cargo build with cwd.
+- When writing files, do not add leading blank lines unless the user explicitly asked for them.
+- When creating Rust projects, use edition = "2024", write Cargo.toml and src/main.rs, then ask to run cargo build with cwd.
 - If you can answer without a tool, answer directly.
 "#;
 
@@ -242,7 +247,10 @@ async fn run_agent_turn(
             log_tool_outcomes(config, &outcomes)?;
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: format!("Tool results:\n{}", format_tool_results(&outcomes)),
+                content: format!(
+                    "Tool results:\n{}\n\nContinue the original request. If any remaining step requires a tool, output only the next tool call.",
+                    format_tool_results(&outcomes)
+                ),
             });
             print_turn_summary(&outcomes);
             continue;
@@ -272,7 +280,8 @@ async fn request_plan_first(
         content: "First provide a short implementation plan. Do not call tools yet.".to_string(),
     });
 
-    let plan = call_ollama(client, ollama_url, model, messages).await?;
+    let raw_plan = call_ollama(client, ollama_url, model, messages).await?;
+    let plan = sanitize_plan_response(&raw_plan);
     append_session_event(config, "plan", json!({ "content": plan }))?;
     println!("\nPlan:\n{plan}\n");
     messages.push(ChatMessage {
@@ -284,6 +293,71 @@ async fn request_plan_first(
         content: "Now execute the plan using tools. Do not repeat the plan.".to_string(),
     });
     Ok(())
+}
+
+fn sanitize_plan_response(plan: &str) -> String {
+    let plan = remove_tagged_block(plan, "<tool_call>", "</tool_call>");
+    let plan = remove_tagged_block(&plan, "<write_file", "</write_file>");
+    let plan = remove_fenced_json_tool_calls(&plan);
+    let plan = plan
+        .lines()
+        .filter(|line| !is_standalone_tool_call_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    plan.trim().to_string()
+}
+
+fn remove_tagged_block(input: &str, start_marker: &str, end_marker: &str) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some(start) = rest.find(start_marker) {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let Some(end_relative) = after_start.find(end_marker) else {
+            output.push_str(after_start);
+            return output;
+        };
+        rest = &after_start[end_relative + end_marker.len()..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn remove_fenced_json_tool_calls(input: &str) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some(fence_start) = rest.find("```") {
+        let after_opening_fence = &rest[fence_start + "```".len()..];
+        let Some(first_newline) = after_opening_fence.find('\n') else {
+            break;
+        };
+        let fenced_body_start = fence_start + "```".len() + first_newline + 1;
+        let Some(relative_fence_end) = rest[fenced_body_start..].find("```") else {
+            break;
+        };
+        let fenced_body = rest[fenced_body_start..fenced_body_start + relative_fence_end].trim();
+        if fenced_body.starts_with('{') && serde_json::from_str::<ToolCall>(fenced_body).is_ok() {
+            output.push_str(&rest[..fence_start]);
+            rest = &rest[fenced_body_start + relative_fence_end + "```".len()..];
+        } else {
+            let keep_end = fenced_body_start + relative_fence_end + "```".len();
+            output.push_str(&rest[..keep_end]);
+            rest = &rest[keep_end..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn is_standalone_tool_call_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    matches!(
+        trimmed,
+        "<read_file" | "<list_dir" | "<shell" | "<write_file" | "<tool_call>"
+    ) || serde_json::from_str::<ToolCall>(trimmed).is_ok()
+        || ["<read_file", "<list_dir", "<shell"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix) && trimmed.ends_with("/>"))
 }
 
 async fn call_ollama(
@@ -375,7 +449,10 @@ fn parse_write_file_blocks(answer: &str) -> Result<Vec<ToolCall>> {
         let Some(close_relative) = rest[content_start..].find("</write_file>") else {
             break;
         };
-        let content = rest[content_start..content_start + close_relative].to_string();
+        let content = normalize_write_file_block_content(
+            &rest[content_start..content_start + close_relative],
+        )
+        .to_string();
         tool_calls.push(ToolCall {
             tool: "write_file".to_string(),
             cmd: String::new(),
@@ -388,6 +465,13 @@ fn parse_write_file_blocks(answer: &str) -> Result<Vec<ToolCall>> {
         rest = &rest[content_start + close_relative + "</write_file>".len()..];
     }
     Ok(tool_calls)
+}
+
+fn normalize_write_file_block_content(content: &str) -> &str {
+    content
+        .strip_prefix("\r\n")
+        .or_else(|| content.strip_prefix('\n'))
+        .unwrap_or(content)
 }
 
 fn parse_xml_style_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
@@ -551,15 +635,13 @@ async fn run_tool_call(
         "shell" => run_shell(config, tool_call, auto_approve).await,
         "read_file" => read_file_tool(config, &tool_call.path).map(unchanged),
         "write_file" => write_file_tool(config, &tool_call.path, &tool_call.content, auto_approve),
-        "patch_file" => {
-            patch_file_tool(
-                config,
-                &tool_call.path,
-                &tool_call.old,
-                &tool_call.new,
-                auto_approve,
-            )
-        }
+        "patch_file" => patch_file_tool(
+            config,
+            &tool_call.path,
+            &tool_call.old,
+            &tool_call.new,
+            auto_approve,
+        ),
         "list_dir" => list_dir_tool(config, &tool_call.path).map(unchanged),
         _ => anyhow::bail!("unsupported tool: {}", tool_call.tool),
     }
@@ -658,7 +740,8 @@ fn write_file_tool(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     let previous_summary = previous_content
         .as_deref()
         .map(|previous_content| {
@@ -713,7 +796,8 @@ fn patch_file_tool(
         return Ok(unchanged("User declined file patch.".to_string()));
     }
 
-    std::fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(&path, updated)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(ToolOutcome {
         result: format!("patched_file: {}", path.display()),
         changed_file: Some(ChangedFile {
@@ -736,7 +820,11 @@ fn list_dir_tool(config: &AppConfig, path: &str) -> Result<String> {
         entries.push(format!("{}{}", entry.file_name().to_string_lossy(), suffix));
     }
     entries.sort();
-    Ok(format!("list_dir: {}\n{}", path.display(), entries.join("\n")))
+    Ok(format!(
+        "list_dir: {}\n{}",
+        path.display(),
+        entries.join("\n")
+    ))
 }
 
 fn workspace_path(config: &AppConfig, path: &str) -> Result<PathBuf> {
@@ -761,8 +849,19 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
     }
 
     let forbidden = [
-        "rm ", "rm\t", "sudo ", "mkfs", "dd ", "shutdown", "reboot", ":(){", "chmod -R",
-        "chown -R", "> /dev/", "git reset --hard", "git checkout --",
+        "rm ",
+        "rm\t",
+        "sudo ",
+        "mkfs",
+        "dd ",
+        "shutdown",
+        "reboot",
+        ":(){",
+        "chmod -R",
+        "chown -R",
+        "> /dev/",
+        "git reset --hard",
+        "git checkout --",
     ];
     if forbidden.iter().any(|token| trimmed.contains(token)) {
         anyhow::bail!("refusing potentially destructive command: {trimmed}");
@@ -810,7 +909,11 @@ fn print_turn_summary(outcomes: &[ToolOutcome]) {
         println!("- {} {}", changed_file.action, changed_file.path.display());
     }
     for command in &commands {
-        let status = if command.success { "succeeded" } else { "failed" };
+        let status = if command.success {
+            "succeeded"
+        } else {
+            "failed"
+        };
         println!(
             "- command `{}` {status} in {}",
             command.cmd,
@@ -870,7 +973,11 @@ fn log_tool_outcomes(config: &AppConfig, outcomes: &[ToolOutcome]) -> Result<()>
     )
 }
 
-fn append_session_event(config: &AppConfig, event_type: &str, data: serde_json::Value) -> Result<()> {
+fn append_session_event(
+    config: &AppConfig,
+    event_type: &str,
+    data: serde_json::Value,
+) -> Result<()> {
     let event = json!({
         "ts": unix_timestamp_secs(),
         "type": event_type,
@@ -1033,4 +1140,48 @@ fn parse_workspace_arg() -> Result<PathBuf> {
     workspace
         .or_else(|| std::env::current_dir().ok())
         .context("failed to determine workspace")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_file_block_content_drops_structural_leading_newline() {
+        assert_eq!(normalize_write_file_block_content("\nhello\n"), "hello\n");
+    }
+
+    #[test]
+    fn write_file_block_content_drops_structural_leading_windows_newline() {
+        assert_eq!(
+            normalize_write_file_block_content("\r\nhello\r\n"),
+            "hello\r\n"
+        );
+    }
+
+    #[test]
+    fn write_file_block_content_preserves_inline_content() {
+        assert_eq!(normalize_write_file_block_content("hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn plan_sanitizer_removes_tool_syntax_from_deepseek_style_plan() {
+        let plan = r#"**Implementation Plan:**
+
+1. Create a file.
+
+<write_file path="hello.txt">
+deepseek smoke test
+</write_file>
+
+{"tool":"shell","cmd":"cat hello.txt"}
+"#;
+
+        let sanitized = sanitize_plan_response(plan);
+
+        assert!(sanitized.contains("Implementation Plan"));
+        assert!(!sanitized.contains("<write_file"));
+        assert!(!sanitized.contains("deepseek smoke test"));
+        assert!(!sanitized.contains(r#""tool":"shell""#));
+    }
 }

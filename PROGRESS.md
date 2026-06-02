@@ -3,6 +3,7 @@
 ## Current Status
 
 The mini-codex prototype can run a local Ollama model as a small coding agent.
+The current default model is `deepseek-r1:14b` through Ollama.
 The latest successful end-to-end test used a clean workspace and asked the agent
 to create, build, and run a Rust project from scratch.
 
@@ -32,7 +33,8 @@ The agent successfully:
 ## Implemented Capabilities
 
 - Ollama chat integration through `/api/chat`.
-- Configurable model with `MINI_CODEX_MODEL`.
+- DeepSeek R1 14B default model through `deepseek-r1:14b`.
+- Configurable model override with `MINI_CODEX_MODEL`.
 - Optional auto-approval with `MINI_CODEX_AUTO_APPROVE=1`.
 - Optional plan-first mode with `MINI_CODEX_PLAN_FIRST=1`.
 - Workspace selection with `--workspace <dir>` or `-w <dir>`.
@@ -62,30 +64,32 @@ The agent successfully:
 
 The final test was successful, but a few improvement points remain:
 
-- The generated Rust project used `edition = "2021"` instead of `2024`.
-- `write_file` created files with a leading blank line in the content.
+- Older prompt guidance allowed generated Rust projects to use `edition = "2021"` instead of `2024`.
+- Older prompt guidance allowed `write_file` content with a leading blank line.
 - The simple diff is line-by-line and not a true unified diff.
 - Auto-approval is useful for fast iteration, but it should remain opt-in.
 - The model sometimes mixes prose, Markdown, and tool calls; parser tolerance helped a lot.
 
 ## Recommended Next Steps
 
-1. Add a config file, for example `.mini-codex.toml`, so model, workspace,
+1. Validate DeepSeek R1 14B end-to-end on project creation, file edits, and command execution.
+
+2. Add a config file, for example `.mini-codex.toml`, so model, workspace,
    auto-approval, and plan-first mode do not need environment variables.
 
-2. Add stronger workspace safety:
+3. Add stronger workspace safety:
    - canonicalize tool paths after joining;
    - reject symlink escapes;
    - keep all reads and writes inside the configured workspace.
 
-3. Replace `patch_file` with a real unified-diff `apply_patch` tool.
+4. Replace `patch_file` with a real unified-diff `apply_patch` tool.
 
-4. Improve tool result logging:
+5. Improve tool result logging:
    - log the exact tool call before execution;
    - include approval mode;
    - include command duration.
 
-5. Add a final task report command or automatic final report:
+6. Add a final task report command or automatic final report:
 
 ```text
 Summary:
@@ -97,14 +101,14 @@ Changed files:
 - final-agent/src/main.rs
 ```
 
-6. Add tests for parser behavior:
+7. Add tests for parser behavior:
    - raw JSON;
    - fenced JSON;
    - XML-style tools;
    - multiple tool calls;
    - write_file blocks.
 
-7. Add a safer project-generation workflow:
+8. Add a safer project-generation workflow:
    - prefer `edition = "2024"` for new Rust projects;
    - avoid leading blank lines in generated files;
    - run formatting after generation when requested.
@@ -114,7 +118,7 @@ Changed files:
 ```bash
 cd /home/jcarvalho/development/pessoal/ia/codex/codex-rs/mini-codex
 source "$HOME/.cargo/env"
-MINI_CODEX_MODEL=qwen2.5-coder:7b \
+MINI_CODEX_MODEL=deepseek-r1:14b \
 MINI_CODEX_AUTO_APPROVE=1 \
 MINI_CODEX_PLAN_FIRST=1 \
 cargo run -- --workspace /tmp/mini-codex-final-test
