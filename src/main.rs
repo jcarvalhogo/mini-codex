@@ -9,7 +9,7 @@ mod session;
 mod tools;
 mod types;
 
-use cli::env_flag;
+use cli::env_flag_or;
 use cli::parse_workspace_arg;
 use cli::prompt;
 use llm::ollama::call_ollama;
@@ -19,6 +19,8 @@ use session::append_session_event;
 use session::init_session_log;
 use session::log_tool_outcomes;
 use tools::format_tool_results;
+use tools::parser::deferred_command_feedback;
+use tools::parser::looks_like_deferred_command_instructions;
 use tools::parser::looks_like_unsupported_tool_request;
 use tools::parser::parse_tool_calls;
 use tools::parser::unsupported_tool_feedback;
@@ -88,6 +90,7 @@ Rules:
 - Prefer small, specific commands.
 - Do not use destructive commands.
 - When creating Rust projects, use edition = "2024", write Cargo.toml and src/main.rs, then ask to run cargo build with cwd.
+- When creating React projects, prefer a minimal Vite app. If the user gives a project name, write every file under that directory and run shell commands with cwd set to that directory. Write package.json, index.html, vite.config.js, src/main.jsx, src/App.jsx, and optionally src/App.css. In index.html use <script type="module" src="/src/main.jsx"></script>. Then use shell to run npm install and npm run build with cwd.
 - If you can answer without a tool, answer directly.
 "#;
 
@@ -98,8 +101,8 @@ async fn main() -> Result<()> {
     let model_profile = profile_for_model(&model)?;
     let ollama_url =
         std::env::var("MINI_CODEX_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
-    let auto_approve = env_flag("MINI_CODEX_AUTO_APPROVE");
-    let plan_first = env_flag("MINI_CODEX_PLAN_FIRST");
+    let auto_approve = env_flag_or("MINI_CODEX_AUTO_APPROVE", true);
+    let plan_first = env_flag_or("MINI_CODEX_PLAN_FIRST", true);
     let workspace = parse_workspace_arg()?.canonicalize().with_context(|| {
         "failed to resolve workspace; create it first or pass an existing directory".to_string()
     })?;
@@ -236,6 +239,21 @@ async fn run_agent_turn(
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: unsupported_tool_feedback(),
+            });
+            continue;
+        }
+
+        if looks_like_deferred_command_instructions(original_request, &answer) {
+            println!(
+                "\nModel provided command instructions instead of running them. Asking it to use shell.\n"
+            );
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: answer,
+            });
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: deferred_command_feedback(original_request),
             });
             continue;
         }

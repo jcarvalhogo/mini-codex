@@ -22,10 +22,10 @@ pub(crate) fn approve_or_prompt(auto_approve: bool, label: &str) -> Result<bool>
     Ok(matches!(approval.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-pub(crate) fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag_or(name: &str, default: bool) -> bool {
     std::env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 pub(crate) fn parse_workspace_arg() -> Result<PathBuf> {

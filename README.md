@@ -33,10 +33,14 @@ The default model is `deepseek-r1:14b`. You can override it with another support
 MINI_CODEX_MODEL=deepseek-r1:32b cargo run -- --workspace /path/to/workspace
 ```
 
-For faster local iteration:
+Tool calls are auto-approved by default. To review every shell command and file write before it runs:
 
 ```bash
-MINI_CODEX_AUTO_APPROVE=1 \
-MINI_CODEX_PLAN_FIRST=1 \
-cargo run -- --workspace /tmp/mini-codex-workspace
+MINI_CODEX_AUTO_APPROVE=0 cargo run -- --workspace /path/to/workspace
+```
+
+Plan-first mode is also enabled by default. To skip the planning step:
+
+```bash
+MINI_CODEX_PLAN_FIRST=0 cargo run -- --workspace /tmp/mini-codex-workspace
 ```

@@ -49,6 +49,59 @@ pub(crate) fn unsupported_tool_feedback() -> String {
     "The previous response requested an unsupported tool. Mini Codex only supports shell, read_file, write_file, patch_file, and list_dir. If parsing HTML or structured text is needed, use the shell tool to run an available command or script. Output only the next supported tool call if more work is needed.".to_string()
 }
 
+pub(crate) fn looks_like_deferred_command_instructions(
+    original_request: &str,
+    answer: &str,
+) -> bool {
+    let original = original_request.to_lowercase();
+    if ![
+        "run", "rode", "rodar", "execute", "executar", "install", "instale", "instalar", "build",
+        "validar", "validate", "test", "teste",
+    ]
+    .iter()
+    .any(|marker| original.contains(marker))
+    {
+        return false;
+    }
+
+    let answer = answer.to_lowercase();
+    let gives_shell_command = [
+        "npm install",
+        "npm run",
+        "cargo build",
+        "cargo test",
+        "cargo run",
+        "python ",
+        "python3 ",
+        "node ",
+    ]
+    .iter()
+    .any(|command| answer.contains(command));
+
+    let instructs_user = [
+        "run `",
+        "run the",
+        "execute `",
+        "execute the",
+        "rode `",
+        "rode o",
+        "execute o",
+        "you can run",
+        "follow these steps",
+        "siga estes passos",
+    ]
+    .iter()
+    .any(|phrase| answer.contains(phrase));
+
+    gives_shell_command && instructs_user
+}
+
+pub(crate) fn deferred_command_feedback(original_request: &str) -> String {
+    format!(
+        "Original request:\n{original_request}\n\nThe previous response gave shell commands as instructions instead of running them. Mini Codex has a shell tool. If commands remain, output only the next shell tool call. Include cwd when the command belongs inside a project directory."
+    )
+}
+
 fn parse_line_delimited_json_tool_calls(answer: &str) -> Result<Vec<ToolCall>> {
     let mut tool_calls = Vec::new();
     for line in answer
@@ -337,6 +390,24 @@ BeautifulSoup
         assert!(!looks_like_unsupported_tool_request(
             "The command succeeded and no further steps are needed."
         ));
+    }
+
+    #[test]
+    fn detects_deferred_npm_commands_when_user_asked_to_run_them() {
+        let original =
+            "Crie um projeto React, instale as dependencias e rode o build para validar.";
+        let answer =
+            "To complete setup, follow these steps: run `npm install`, then run `npm run build`.";
+
+        assert!(looks_like_deferred_command_instructions(original, answer));
+    }
+
+    #[test]
+    fn plain_npm_guidance_is_allowed_when_user_did_not_ask_to_run_it() {
+        let original = "Como eu crio um projeto React?";
+        let answer = "You can run `npm install` and `npm run build` later.";
+
+        assert!(!looks_like_deferred_command_instructions(original, answer));
     }
 
     #[test]
