@@ -9,7 +9,12 @@ use anyhow::Context;
 use anyhow::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::timeout;
+
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 120;
+const LONG_RUNNING_SHELL_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) async fn run_tool_calls(
     config: &AppConfig,
@@ -55,7 +60,6 @@ async fn run_shell(
     tool_call: ToolCall,
     auto_approve: bool,
 ) -> Result<ToolOutcome> {
-    validate_shell_command(&tool_call.cmd)?;
     let cwd = if tool_call.cwd.trim().is_empty() {
         config.workspace.clone()
     } else {
@@ -70,13 +74,49 @@ async fn run_shell(
         return Ok(unchanged("User declined command.".to_string()));
     }
 
-    let output = Command::new("bash")
+    if let Err(err) = validate_shell_command(&tool_call.cmd) {
+        return Ok(ToolOutcome {
+            result: format!(
+                "cwd: {}\nblocked_command: {}\nstdout:\n\nstderr:\n{}",
+                cwd.display(),
+                tool_call.cmd,
+                err
+            ),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: tool_call.cmd,
+                cwd,
+                success: false,
+            }),
+        });
+    }
+
+    let timeout_secs = shell_timeout_secs(&tool_call.cmd);
+    let mut command = Command::new("bash");
+    command
         .arg("-lc")
         .arg(&tool_call.cmd)
         .current_dir(&cwd)
-        .output()
-        .await
-        .context("failed to run shell command")?;
+        .kill_on_drop(true);
+
+    let output = match timeout(Duration::from_secs(timeout_secs), command.output()).await {
+        Ok(output) => output.context("failed to run shell command")?,
+        Err(_) => {
+            return Ok(ToolOutcome {
+                result: format!(
+                    "cwd: {}\ntimed_out_after_secs: {}\nstdout:\n\nstderr:\nCommand did not finish before the timeout. It may be a long-running server command.",
+                    cwd.display(),
+                    timeout_secs
+                ),
+                changed_file: None,
+                command: Some(ExecutedCommand {
+                    cmd: tool_call.cmd,
+                    cwd,
+                    success: false,
+                }),
+            });
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -95,6 +135,31 @@ async fn run_shell(
             success: output.status.success(),
         }),
     })
+}
+
+fn shell_timeout_secs(cmd: &str) -> u64 {
+    if is_likely_long_running_shell_command(cmd) {
+        LONG_RUNNING_SHELL_TIMEOUT_SECS
+    } else {
+        DEFAULT_SHELL_TIMEOUT_SECS
+    }
+}
+
+fn is_likely_long_running_shell_command(cmd: &str) -> bool {
+    let cmd = cmd.to_lowercase();
+    [
+        "npm run dev",
+        "npm start",
+        "yarn dev",
+        "yarn start",
+        "pnpm dev",
+        "pnpm start",
+        "vite --host",
+        "vite --watch",
+        "cargo watch",
+    ]
+    .iter()
+    .any(|marker| cmd.contains(marker))
 }
 
 fn read_file_tool(config: &AppConfig, path: &str) -> Result<String> {
@@ -324,6 +389,32 @@ pub(crate) fn tool_result_guidance(outcomes: &[ToolOutcome]) -> String {
     if commands.iter().any(|command| !command.success) {
         guidance.push("One or more commands failed. Do not repeat failed commands unchanged; choose a different supported approach.");
     }
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.result.contains("blocked_command:"))
+    {
+        guidance.push("A command was blocked for safety. Do not repeat it. Use non-destructive file tools or patch the existing files instead.");
+    }
+    if commands.iter().any(|command| command.cmd.contains("cd ")) {
+        guidance.push("Do not use cd in shell commands. It does not persist between tool calls. Set the shell tool cwd to the target directory instead.");
+    }
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.result.contains("timed_out_after_secs:"))
+    {
+        guidance.push("A command timed out. It was probably a long-running server; do not repeat it. Use a finite validation command such as a build, test, or file read.");
+    }
+    if commands
+        .iter()
+        .any(|command| !command.success && command.cmd.contains("npm run dev"))
+    {
+        guidance.push("Do not use npm run dev for validation. For Vite projects, ensure package.json has scripts, then run npm run build with cwd set to the project directory.");
+    }
+    if commands.iter().any(|command| {
+        command.cmd.starts_with("npm ") && command.cwd.ends_with("mini-codex-react-test")
+    }) {
+        guidance.push("The npm command appears to have run at the workspace root. For named projects, set cwd to the project directory such as meu-react-app.");
+    }
     if commands.iter().any(|command| {
         command.cmd.contains(".html")
             || command.cmd.contains("<h1")
@@ -331,6 +422,12 @@ pub(crate) fn tool_result_guidance(outcomes: &[ToolOutcome]) -> String {
             || command.cmd.contains("sed")
     }) {
         guidance.push("For HTML parsing, prefer shell with python3 and standard-library parsing or a single robust command instead of fragile multi-line grep/sed patterns.");
+    }
+    if commands
+        .iter()
+        .any(|command| !command.success && command.cmd.contains("cargo build"))
+    {
+        guidance.push("For failed Rust builds, inspect Cargo.toml and src/main.rs, patch the compile errors, then run cargo build again. Prefer removing unnecessary external crates for simple apps.");
     }
 
     if guidance.is_empty() {
@@ -518,6 +615,72 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_guidance_warns_after_failed_cargo_build() {
+        let outcomes = vec![ToolOutcome {
+            result: "error[E0432]: unresolved import".to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "cargo build".to_string(),
+                cwd: PathBuf::from("/tmp/workspace/hello-agent"),
+                success: false,
+            }),
+        }];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("For failed Rust builds"));
+        assert!(guidance.contains("patch the compile errors"));
+    }
+
+    #[test]
+    fn tool_result_guidance_warns_after_blocked_command() {
+        let outcomes = vec![ToolOutcome {
+            result: "blocked_command: rm -rf meu-react-app".to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "rm -rf meu-react-app".to_string(),
+                cwd: PathBuf::from("/tmp/workspace"),
+                success: false,
+            }),
+        }];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("blocked for safety"));
+        assert!(guidance.contains("Do not repeat it"));
+    }
+
+    #[test]
+    fn tool_result_guidance_warns_after_cd_and_failed_npm_dev() {
+        let outcomes = vec![
+            ToolOutcome {
+                result: "ok".to_string(),
+                changed_file: None,
+                command: Some(ExecutedCommand {
+                    cmd: "cd meu-react-app".to_string(),
+                    cwd: PathBuf::from("/tmp/mini-codex-react-test"),
+                    success: true,
+                }),
+            },
+            ToolOutcome {
+                result: "npm ERR! Missing script: \"dev\"".to_string(),
+                changed_file: None,
+                command: Some(ExecutedCommand {
+                    cmd: "npm run dev".to_string(),
+                    cwd: PathBuf::from("/tmp/mini-codex-react-test"),
+                    success: false,
+                }),
+            },
+        ];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("Do not use cd"));
+        assert!(guidance.contains("Do not use npm run dev for validation"));
+        assert!(guidance.contains("workspace root"));
+    }
+
+    #[test]
     fn tool_result_guidance_stops_when_successful_stdout_has_answer() {
         let outcomes = vec![ToolOutcome {
             result: "cwd: /tmp/workspace\nexit_status: exit status: 0\nstdout:\ntitle>Artificial intelligence in marketing - Wikipedia\nstderr:\n".to_string(),
@@ -543,6 +706,18 @@ mod tests {
         assert!(!stdout_has_content(
             "cwd: /tmp\nexit_status: exit status: 0\nstdout:\n\nstderr:\n"
         ));
+    }
+
+    #[test]
+    fn dev_server_commands_get_short_timeout() {
+        assert_eq!(
+            shell_timeout_secs("npm run dev"),
+            LONG_RUNNING_SHELL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            shell_timeout_secs("npm install"),
+            DEFAULT_SHELL_TIMEOUT_SECS
+        );
     }
 
     #[test]

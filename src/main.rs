@@ -32,6 +32,7 @@ use types::AppConfig;
 use types::ChatMessage;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
+const MAX_TOOL_TURNS: usize = 12;
 
 const BASE_SYSTEM_PROMPT: &str = r#"
 You are Mini Codex, a local coding assistant.
@@ -87,10 +88,12 @@ Rules:
 - Prefer read_file, write_file, patch_file, and list_dir for file operations.
 - For small edits to existing files, use patch_file instead of write_file.
 - Prefer shell with cwd over commands that start with cd.
+- Do not use cd in shell commands; cwd does not persist between tool calls.
+- Do not create empty files with touch before writing them. Use write_file with the final content.
 - Prefer small, specific commands.
 - Do not use destructive commands.
-- When creating Rust projects, use edition = "2024", write Cargo.toml and src/main.rs, then ask to run cargo build with cwd.
-- When creating React projects, prefer a minimal Vite app. If the user gives a project name, write every file under that directory and run shell commands with cwd set to that directory. Write package.json, index.html, vite.config.js, src/main.jsx, src/App.jsx, and optionally src/App.css. In index.html use <script type="module" src="/src/main.jsx"></script>. Then use shell to run npm install and npm run build with cwd.
+- When creating Rust projects, use edition = "2024", write Cargo.toml and src/main.rs, then use shell to run cargo build with cwd. For simple apps, prefer standard-library Rust with no external crates. Do not add web frameworks such as hyper, axum, or actix unless the user explicitly asks for an HTTP server or API.
+- When creating React projects, prefer a minimal Vite app. If the user gives a project name, write every file under that directory and run shell commands with cwd set to that directory. Write package.json directly with dev and build scripts; do not use npm init -y. Write index.html, vite.config.js, src/main.jsx, src/App.jsx, and optionally src/App.css. In index.html include <div id="root"></div> and use <script type="module" src="/src/main.jsx"></script>. Then use shell to run npm install and npm run build with cwd. Do not run npm run dev unless the user explicitly asks you to start a dev server.
 - If you can answer without a tool, answer directly.
 "#;
 
@@ -202,7 +205,7 @@ async fn run_agent_turn(
         request_plan_first(config, client, ollama_url, model, model_profile, messages).await?;
     }
 
-    for _ in 0..6 {
+    for _ in 0..MAX_TOOL_TURNS {
         let answer = call_ollama(client, ollama_url, model, messages).await?;
         append_session_event(config, "assistant", json!({ "content": answer }))?;
 
@@ -266,7 +269,7 @@ async fn run_agent_turn(
         return Ok(());
     }
 
-    println!("\nStopped after too many tool calls.\n");
+    println!("\nStopped after {MAX_TOOL_TURNS} tool turns.\n");
     Ok(())
 }
 
