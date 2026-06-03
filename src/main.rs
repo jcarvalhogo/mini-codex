@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use serde_json::json;
+use std::collections::HashMap;
 
 mod cli;
 mod llm;
@@ -30,6 +31,7 @@ use tools::run_tool_calls;
 use tools::tool_result_guidance;
 use types::AppConfig;
 use types::ChatMessage;
+use types::ToolOutcome;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434/api/chat";
 const MAX_TOOL_TURNS: usize = 12;
@@ -205,6 +207,7 @@ async fn run_agent_turn(
         request_plan_first(config, client, ollama_url, model, model_profile, messages).await?;
     }
 
+    let mut failed_command_counts = HashMap::new();
     for _ in 0..MAX_TOOL_TURNS {
         let answer = call_ollama(client, ollama_url, model, messages).await?;
         append_session_event(config, "assistant", json!({ "content": answer }))?;
@@ -220,7 +223,13 @@ async fn run_agent_turn(
             print_tool_results(&outcomes);
             log_tool_outcomes(config, &outcomes)?;
             let tool_results = format_tool_results(&outcomes);
-            let followup_guidance = tool_result_guidance(&outcomes);
+            let repeat_guidance = repeated_failed_command_guidance(
+                &outcomes,
+                &mut failed_command_counts,
+                MAX_REPEATED_FAILED_COMMANDS,
+            );
+            let followup_guidance =
+                format!("{}{}", tool_result_guidance(&outcomes), repeat_guidance);
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: format!(
@@ -230,6 +239,15 @@ async fn run_agent_turn(
                 ),
             });
             print_turn_summary(&outcomes);
+            if let Some(command) = repeated_failed_command_to_stop(
+                &failed_command_counts,
+                MAX_REPEATED_FAILED_COMMANDS,
+            ) {
+                println!(
+                    "\nStopped after repeating the same failed command {MAX_REPEATED_FAILED_COMMANDS} times:\n{command}\n"
+                );
+                return Ok(());
+            }
             continue;
         }
 
@@ -273,6 +291,48 @@ async fn run_agent_turn(
     Ok(())
 }
 
+const MAX_REPEATED_FAILED_COMMANDS: usize = 3;
+
+fn repeated_failed_command_guidance(
+    outcomes: &[ToolOutcome],
+    failed_command_counts: &mut HashMap<String, usize>,
+    max_repeats: usize,
+) -> String {
+    let mut repeated = Vec::new();
+    for command in outcomes
+        .iter()
+        .filter_map(|outcome| outcome.command.as_ref())
+        .filter(|command| !command.success)
+    {
+        let count = failed_command_counts
+            .entry(command.cmd.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if *count >= 2 {
+            repeated.push(format!("`{}` failed {count} times", command.cmd));
+        }
+    }
+
+    if repeated.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRepeated failure guidance:\n- Do not repeat the same failed command. {}\n- Fix the root cause first by reading or patching the relevant file, then run a different validation command. The turn will stop after {max_repeats} repeats of the same failed command.",
+            repeated.join("; ")
+        )
+    }
+}
+
+fn repeated_failed_command_to_stop(
+    failed_command_counts: &HashMap<String, usize>,
+    max_repeats: usize,
+) -> Option<&str> {
+    failed_command_counts
+        .iter()
+        .find(|(_, count)| **count >= max_repeats)
+        .map(|(command, _)| command.as_str())
+}
+
 async fn request_plan_first(
     config: &AppConfig,
     client: &reqwest::Client,
@@ -299,4 +359,45 @@ async fn request_plan_first(
         content: model_profile.execute_plan_prompt().to_string(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use types::ExecutedCommand;
+
+    #[test]
+    fn repeated_failed_command_guidance_warns_on_second_failure() {
+        let mut counts = HashMap::new();
+        let outcomes = vec![ToolOutcome {
+            result: "failed".to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "npm install".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                success: false,
+            }),
+        }];
+
+        assert_eq!(
+            repeated_failed_command_guidance(&outcomes, &mut counts, 3),
+            ""
+        );
+        let guidance = repeated_failed_command_guidance(&outcomes, &mut counts, 3);
+
+        assert!(guidance.contains("failed 2 times"));
+        assert!(guidance.contains("Do not repeat the same failed command"));
+    }
+
+    #[test]
+    fn repeated_failed_command_stops_at_limit() {
+        let mut counts = HashMap::new();
+        counts.insert("npm install".to_string(), 3);
+
+        assert_eq!(
+            repeated_failed_command_to_stop(&counts, 3),
+            Some("npm install")
+        );
+    }
 }

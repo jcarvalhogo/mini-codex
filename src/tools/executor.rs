@@ -410,8 +410,15 @@ pub(crate) fn tool_result_guidance(outcomes: &[ToolOutcome]) -> String {
     {
         guidance.push("Do not use npm run dev for validation. For Vite projects, ensure package.json has scripts, then run npm run build with cwd set to the project directory.");
     }
+    if outcomes.iter().any(|outcome| {
+        outcome.result.contains("EJSONPARSE")
+            || outcome.result.contains("package.json must be actual JSON")
+    }) {
+        guidance.push("npm reported invalid package.json JSON. Do not run npm install again yet. Read package.json, rewrite it as valid strict JSON with no trailing text or JavaScript, then run npm install with cwd set to the project directory.");
+    }
     if commands.iter().any(|command| {
-        command.cmd.starts_with("npm ") && command.cwd.ends_with("mini-codex-react-test")
+        (command.cmd.starts_with("npm ") || command.cmd.contains("&& npm "))
+            && command.cwd.ends_with("mini-codex-react-test")
     }) {
         guidance.push("The npm command appears to have run at the workspace root. For named projects, set cwd to the project directory such as meu-react-app.");
     }
@@ -677,6 +684,26 @@ mod tests {
 
         assert!(guidance.contains("Do not use cd"));
         assert!(guidance.contains("Do not use npm run dev for validation"));
+        assert!(guidance.contains("workspace root"));
+    }
+
+    #[test]
+    fn tool_result_guidance_warns_after_npm_json_parse_error() {
+        let outcomes = vec![ToolOutcome {
+            result: "npm ERR! code EJSONPARSE\nnpm ERR! package.json must be actual JSON"
+                .to_string(),
+            changed_file: None,
+            command: Some(ExecutedCommand {
+                cmd: "cd meu-react-app && npm install".to_string(),
+                cwd: PathBuf::from("/tmp/mini-codex-react-test"),
+                success: false,
+            }),
+        }];
+
+        let guidance = tool_result_guidance(&outcomes);
+
+        assert!(guidance.contains("invalid package.json JSON"));
+        assert!(guidance.contains("Do not run npm install again yet"));
         assert!(guidance.contains("workspace root"));
     }
 
